@@ -58,40 +58,6 @@ app.delete('/api/transactions/:id', async (req, res) => {
   }
 });
 
-// ===== BUDGETS =====
-app.get('/api/budgets', async (req, res) => {
-  const bridge = getPythonBridge();
-  try {
-    const result = await bridge.send({ action: 'get_budgets' });
-    res.json(result.data || []);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.post('/api/budgets', async (req, res) => {
-  const bridge = getPythonBridge();
-  const { category, limit } = req.body;
-  if (!category || !limit) return res.status(400).json({ error: 'Field tidak lengkap' });
-  const budget = { id: uuidv4(), category, limit: +limit, created_at: new Date().toISOString() };
-  try {
-    await bridge.send({ action: 'add_budget', data: budget });
-    res.json(budget);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.delete('/api/budgets/:id', async (req, res) => {
-  const bridge = getPythonBridge();
-  try {
-    await bridge.send({ action: 'delete_budget', id: req.params.id });
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
 // ===== INVESTMENTS =====
 app.get('/api/investments', async (req, res) => {
   const bridge = getPythonBridge();
@@ -206,13 +172,12 @@ function extAuth(req, res, next) {
 app.get('/ext/summary', extAuth, async (req, res) => {
   const bridge = getPythonBridge();
   try {
-    const [txRes, budgetRes, invRes, billRes] = await Promise.all([
+    const [txRes, invRes, billRes] = await Promise.all([
       bridge.send({ action: 'get_transactions' }),
-      bridge.send({ action: 'get_budgets' }),
       bridge.send({ action: 'get_investments' }),
       bridge.send({ action: 'get_bills' }),
     ]);
-    res.json({ transactions: txRes.data||[], budgets: budgetRes.data||[], investments: invRes.data||[], bills: billRes.data||[] });
+    res.json({ transactions: txRes.data||[], investments: invRes.data||[], bills: billRes.data||[] });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -233,26 +198,6 @@ app.post('/ext/transactions', extAuth, async (req, res) => {
 app.delete('/ext/transactions/:id', extAuth, async (req, res) => {
   const bridge = getPythonBridge();
   try { await bridge.send({ action: 'delete_transaction', id: req.params.id }); res.json({ ok: true }); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// Budgets CRUD (external)
-app.get('/ext/budgets', extAuth, async (req, res) => {
-  const bridge = getPythonBridge();
-  try { const r = await bridge.send({ action: 'get_budgets' }); res.json(r.data||[]); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.post('/ext/budgets', extAuth, async (req, res) => {
-  const bridge = getPythonBridge();
-  const { category, limit } = req.body;
-  if (!category || !limit) return res.status(400).json({ error: 'Field tidak lengkap' });
-  const budget = { id: uuidv4(), category, limit: +limit, created_at: new Date().toISOString() };
-  try { await bridge.send({ action: 'add_budget', data: budget }); res.json(budget); }
-  catch (e) { res.status(500).json({ error: e.message }); }
-});
-app.delete('/ext/budgets/:id', extAuth, async (req, res) => {
-  const bridge = getPythonBridge();
-  try { await bridge.send({ action: 'delete_budget', id: req.params.id }); res.json({ ok: true }); }
   catch (e) { res.status(500).json({ error: e.message }); }
 });
 

@@ -2,7 +2,6 @@
 // ===== STATE =====
 const state = {
   transactions: [],
-  budgets: [],
   investments: [],
   bills: [],
   dbConnected: false,
@@ -76,7 +75,6 @@ function navigate(page) {
   else if (page === 'pengeluaran') renderExpenseTable();
   else if (page === 'laporan') renderReport();
   else if (page === 'transaksi') { allPage = 1; renderAllTable(); }
-  else if (page === 'anggaran') renderBudgets();
   else if (page === 'investasi') renderInvestasi();
   else if (page === 'tagihan') renderTagihan();
 }
@@ -119,15 +117,13 @@ function setStatus(connected) {
 // ===== LOAD DATA =====
 async function loadAll() {
   try {
-    const [txData, budgetData, statusData, invData, billData] = await Promise.all([
+    const [txData, statusData, invData, billData] = await Promise.all([
       API.get('/transactions'),
-      API.get('/budgets'),
       API.get('/status'),
       API.get('/investments'),
       API.get('/bills'),
     ]);
     state.transactions = txData;
-    state.budgets = budgetData;
     state.investments = invData;
     state.bills = billData;
     setStatus(statusData.connected);
@@ -182,7 +178,6 @@ function renderDashboard() {
 
   renderCashflowChart();
   renderCategoryChart(txs);
-  renderBudgetStatus(txs);
   renderRecentTx(txs);
 }
 
@@ -242,29 +237,6 @@ function renderCategoryChart(txs) {
 
   const legend = document.getElementById('donutLegend');
   legend.innerHTML = cats.map((c,i)=>`<div class="donut-legend-item"><div class="donut-legend-dot" style="background:${CHART_COLORS[i]}"></div><span>${c}</span></div>`).join('');
-}
-
-// ===== BUDGET STATUS (Dashboard) =====
-function renderBudgetStatus(txs) {
-  const list = document.getElementById('budgetList');
-  const expenses = txs.filter(t=>t.type==='expense');
-  if (!state.budgets.length) { list.innerHTML = '<div style="text-align:center;padding:20px;color:var(--text-muted);font-size:0.82rem">Belum ada anggaran</div>'; return; }
-  list.innerHTML = state.budgets.slice(0,5).map(b => {
-    const spent = expenses.filter(t=>t.category===b.category).reduce((s,t)=>s+t.amount,0);
-    const pct = getPct(spent, b.limit);
-    const cls = pct >= 100 ? 'over' : pct >= 80 ? 'warn' : 'ok';
-    const statusLabel = pct >= 100 ? 'Melebihi' : pct >= 80 ? 'Hampir' : 'Aman';
-    return `<div class="budget-item">
-      <div class="budget-item-header">
-        <span class="budget-item-name">${b.category}</span>
-        <div style="display:flex;align-items:center;gap:8px">
-          <span class="budget-item-values">${fmt(spent)} / ${fmt(b.limit)}</span>
-          <span class="budget-item-status ${cls}">${statusLabel}</span>
-        </div>
-      </div>
-      <div class="progress-bar"><div class="progress-fill ${cls}" style="width:${Math.min(pct,100)}%"></div></div>
-    </div>`;
-  }).join('');
 }
 
 // ===== RECENT TRANSACTIONS =====
@@ -488,9 +460,9 @@ function initReportFilters() {
 }));
 
 // ===== REPORT AI =====
-document.getElementById('btnReportAI').addEventListener('click', loadReportAI);
+document.getElementById('btnReportAI').addEventListener('click', () => loadReportAI(false));
 
-async function loadReportAI() {
+async function loadReportAI(force = false) {
   const year = +document.getElementById('reportYear').value;
   const month = +document.getElementById('reportMonth').value;
   const monthStr = year + '-' + String(month).padStart(2, '0');
@@ -503,22 +475,13 @@ async function loadReportAI() {
   const balance = income - expense;
   const saving_rate = income > 0 ? Math.round((income - expense) / income * 100) : 0;
 
-  // Top expense categories
   const expCatMap = {};
   txs.filter(t=>t.type==='expense').forEach(t => { expCatMap[t.category] = (expCatMap[t.category]||0) + t.amount; });
   const top_expense_cats = Object.entries(expCatMap).sort((a,b)=>b[1]-a[1]).slice(0,5).map(([name,amount])=>({name,amount}));
 
-  // Top income categories
   const incCatMap = {};
   txs.filter(t=>t.type==='income').forEach(t => { incCatMap[t.category] = (incCatMap[t.category]||0) + t.amount; });
   const top_income_cats = Object.entries(incCatMap).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([name,amount])=>({name,amount}));
-
-  // Budget status bulan ini
-  const budgets = state.budgets.map(b => {
-    const spent = txs.filter(t=>t.type==='expense'&&t.category===b.category).reduce((s,t)=>s+t.amount,0);
-    const pct = b.limit > 0 ? Math.round(spent/b.limit*100) : 0;
-    return { category: b.category, pct };
-  });
 
   const months = ['','Januari','Februari','Maret','April','Mei','Juni','Juli','Agustus','September','Oktober','November','Desember'];
   const month_label = `${months[month]} ${year}`;
@@ -530,25 +493,23 @@ async function loadReportAI() {
   section.style.display = 'block';
   loading.style.display = 'flex';
   content.innerHTML = '';
-
-  // Scroll ke section AI
   section.scrollIntoView({ behavior: 'smooth', block: 'start' });
 
   try {
     const res = await fetch('/api/report/ai', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ month_label, income, expense, balance, saving_rate, top_expense_cats, top_income_cats, tx_count: txs.length, budgets })
+      body: JSON.stringify({ month_label, month_key: monthStr, force, income, expense, balance, saving_rate, top_expense_cats, top_income_cats, tx_count: txs.length })
     });
     if (!res.ok) throw new Error(await res.text());
     const data = await res.json();
     if (!data.ok) throw new Error(data.error);
     loading.style.display = 'none';
-    content.innerHTML = renderReportAIContent(data.data, month_label);
+    content.innerHTML = renderReportAIContent(data.data, month_label, data.cached, data.analyzed_at);
   } catch(e) {
     loading.style.display = 'none';
     content.innerHTML = `<div class="report-ai-error">
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
       Gagal menganalisa: ${e.message}
       <button class="btn-ghost btn-sm" onclick="loadReportAI()">Coba Lagi</button>
     </div>`;
@@ -556,18 +517,21 @@ async function loadReportAI() {
   }
 }
 
-function renderReportAIContent(d, month_label) {
+function renderReportAIContent(d, month_label, cached = false, analyzed_at = null) {
   const scoreColor = { green:'#10B981', cyan:'#06B6D4', yellow:'#F59E0B', orange:'#FB923C', red:'#F43F5E' }[d.health_color] || '#06B6D4';
-  const scoreBg   = { green:'rgba(16,185,129,0.1)', cyan:'rgba(6,182,212,0.1)', yellow:'rgba(245,158,11,0.1)', orange:'rgba(251,146,60,0.1)', red:'rgba(244,63,94,0.1)' }[d.health_color] || 'rgba(6,182,212,0.1)';
+  const scoreBg    = { green:'rgba(16,185,129,0.08)', cyan:'rgba(6,182,212,0.08)', yellow:'rgba(245,158,11,0.08)', orange:'rgba(251,146,60,0.08)', red:'rgba(244,63,94,0.08)' }[d.health_color] || 'rgba(6,182,212,0.08)';
+  const scoreBorder= { green:'rgba(16,185,129,0.25)', cyan:'rgba(6,182,212,0.25)', yellow:'rgba(245,158,11,0.25)', orange:'rgba(251,146,60,0.25)', red:'rgba(244,63,94,0.25)' }[d.health_color] || 'rgba(6,182,212,0.25)';
+
+  // Donut SVG — radius 40, circumference = 2π×40 = 251.3
+  const R = 40, C = 2 * Math.PI * R;
+  const filled = C * (d.health_score / 100);
 
   const highlightHTML = (d.highlights||[]).map(h => {
     const iconColor = h.type === 'positive' ? '#10B981' : h.type === 'negative' ? '#F43F5E' : '#06B6D4';
-    return `<div class="rpt-highlight-card" style="border-color:${iconColor}20">
-      <div class="rpt-hl-icon" style="color:${iconColor}">${h.icon || '📊'}</div>
-      <div class="rpt-hl-body">
-        <div class="rpt-hl-label">${h.label}</div>
-        <div class="rpt-hl-value" style="color:${iconColor}">${h.value}</div>
-      </div>
+    return `<div class="rpt-hl-card" style="border-top:3px solid ${iconColor}">
+      <div class="rpt-hl-icon">${h.icon || '📊'}</div>
+      <div class="rpt-hl-label">${h.label}</div>
+      <div class="rpt-hl-value" style="color:${iconColor}">${h.value}</div>
     </div>`;
   }).join('');
 
@@ -585,73 +549,79 @@ function renderReportAIContent(d, month_label) {
 
   return `
     <div class="report-ai-card">
-      <div class="rpt-ai-header">
-        <div class="rpt-ai-title">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+
+      <!-- Header -->
+      <div class="rpt-header">
+        <div class="rpt-header-title">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
           Resume AI — ${month_label}
+          ${cached ? `<span class="rpt-cache-badge">Tersimpan</span>` : ''}
         </div>
-        <button class="btn-ghost btn-sm" onclick="loadReportAI()">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-          Analisa Ulang
-        </button>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+          ${analyzed_at ? `<span style="font-size:0.72rem;color:var(--text-muted)">${new Date(analyzed_at).toLocaleString('id-ID')}</span>` : ''}
+          <button class="btn-ghost btn-sm" onclick="loadReportAI(true)">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+            Analisa Ulang
+          </button>
+        </div>
       </div>
 
-      <!-- Health Score + Summary -->
-      <div class="rpt-health-row">
-        <div class="rpt-score-circle" style="--score-color:${scoreColor};--score-bg:${scoreBg}">
-          <div class="rpt-score-inner">
-            <div class="rpt-score-num" style="color:${scoreColor}">${d.health_score}</div>
-            <div class="rpt-score-label">/ 100</div>
-          </div>
-          <svg class="rpt-score-ring" viewBox="0 0 120 120">
-            <circle cx="60" cy="60" r="52" fill="none" stroke="${scoreColor}20" stroke-width="10"/>
-            <circle cx="60" cy="60" r="52" fill="none" stroke="${scoreColor}" stroke-width="10"
-              stroke-dasharray="${Math.round(d.health_score * 3.267)} 326.7"
-              stroke-dashoffset="81.7" stroke-linecap="round"/>
+      <!-- Health Banner -->
+      <div class="rpt-health-banner" style="background:${scoreBg};border:1px solid ${scoreBorder}">
+        <!-- Donut -->
+        <div class="rpt-donut-wrap">
+          <svg width="96" height="96" viewBox="0 0 96 96">
+            <circle cx="48" cy="48" r="${R}" fill="none" stroke="${scoreColor}22" stroke-width="9"/>
+            <circle cx="48" cy="48" r="${R}" fill="none" stroke="${scoreColor}" stroke-width="9"
+              stroke-dasharray="${filled.toFixed(1)} ${C.toFixed(1)}"
+              stroke-dashoffset="${(C * 0.25).toFixed(1)}"
+              stroke-linecap="round"
+              transform="rotate(-90 48 48)"/>
           </svg>
+          <div class="rpt-donut-inner">
+            <span class="rpt-score-num" style="color:${scoreColor}">${d.health_score}</span>
+            <span class="rpt-score-denom">/100</span>
+          </div>
         </div>
-        <div class="rpt-health-right">
-          <div class="rpt-health-label" style="color:${scoreColor}">${d.health_label}</div>
+        <!-- Label + Summary -->
+        <div class="rpt-health-text">
+          <div class="rpt-health-badge" style="color:${scoreColor};background:${scoreBg};border:1px solid ${scoreBorder}">${d.health_label}</div>
           <p class="rpt-summary-text">${d.summary}</p>
         </div>
       </div>
 
       <!-- Highlights -->
-      <div class="rpt-section-title">📌 Poin Utama</div>
-      <div class="rpt-highlights-grid">${highlightHTML}</div>
+      <div style="padding:0 22px 8px"><div class="rpt-section-label">📌 Poin Utama</div></div>
+      <div class="rpt-hl-grid">${highlightHTML}</div>
 
       <!-- Analysis -->
+      <div style="padding:0 22px 8px"><div class="rpt-section-label">📊 Analisa Keuangan</div></div>
       <div class="rpt-two-col">
-        <div class="rpt-analysis-block">
-          <div class="rpt-section-title">💸 Analisa Pengeluaran</div>
-          <p class="rpt-analysis-text">${d.spending_analysis || '-'}</p>
+        <div class="rpt-block">
+          <div class="rpt-section-label">💸 Analisa Pengeluaran</div>
+          <p class="rpt-body-text">${d.spending_analysis || '-'}</p>
         </div>
-        <div class="rpt-analysis-block">
-          <div class="rpt-section-title">💰 Analisa Tabungan</div>
-          <p class="rpt-analysis-text">${d.saving_analysis || '-'}</p>
+        <div class="rpt-block">
+          <div class="rpt-section-label">💰 Analisa Tabungan</div>
+          <p class="rpt-body-text">${d.saving_analysis || '-'}</p>
         </div>
       </div>
 
       <!-- Recommendations & Warnings -->
+      ${(recHTML || warnHTML) ? `
+      <div style="padding:0 22px 8px"><div class="rpt-section-label">💡 Rekomendasi & Perhatian</div></div>
       <div class="rpt-two-col">
-        ${recHTML ? `<div class="rpt-analysis-block">
-          <div class="rpt-section-title">✅ Rekomendasi</div>
-          <div class="rpt-rec-list">${recHTML}</div>
-        </div>` : ''}
-        ${warnHTML ? `<div class="rpt-analysis-block">
-          <div class="rpt-section-title">⚠️ Perhatian</div>
-          <div class="rpt-rec-list">${warnHTML}</div>
-        </div>` : ''}
-      </div>
-
-      <!-- Next Month Tips -->
-      ${d.next_month_tips ? `
-      <div class="rpt-next-tip">
-        <div class="rpt-section-title">🎯 Target Bulan Depan</div>
-        <p class="rpt-analysis-text">${d.next_month_tips}</p>
+        ${recHTML ? `<div class="rpt-block"><div class="rpt-section-label">✅ Rekomendasi</div><div class="rpt-rec-list">${recHTML}</div></div>` : ''}
+        ${warnHTML ? `<div class="rpt-block"><div class="rpt-section-label">⚠️ Perhatian</div><div class="rpt-rec-list">${warnHTML}</div></div>` : ''}
       </div>` : ''}
 
-      <div class="ai-disclaimer">⚠ Analisa bersifat estimasi berdasarkan data transaksi yang dimasukkan. Bukan saran keuangan profesional.</div>
+      <!-- Tips -->
+      ${d.next_month_tips ? `<div class="rpt-tip-box">
+        <div class="rpt-section-label">🎯 Target Bulan Depan</div>
+        <p class="rpt-body-text">${d.next_month_tips}</p>
+      </div>` : ''}
+
+      <div class="ai-disclaimer">⚠ Analisa bersifat estimasi berdasarkan data transaksi. Bukan saran keuangan profesional.</div>
     </div>
   `;
 }
@@ -713,71 +683,6 @@ function renderPagination(pages, cur) {
 }
 window.goPage = (p) => { allPage = p; renderAllTable(); };
 ['searchAll','filterAllType','filterAllCategory','filterAllMonth','filterDateFrom','filterDateTo'].forEach(id=>document.getElementById(id)?.addEventListener('input',()=>{allPage=1;renderAllTable();}));
-
-// ===== BUDGETS =====
-function renderBudgets() {
-  const grid = document.getElementById('budgetGrid');
-  const empty = document.getElementById('budgetEmpty');
-  const now = new Date();
-  const monthStr = now.getFullYear()+'-'+(String(now.getMonth()+1).padStart(2,'0'));
-  const monthTxs = state.transactions.filter(t=>t.type==='expense'&&monthKey(t.date)===monthStr);
-
-  if (!state.budgets.length) { grid.innerHTML = ''; empty.style.display = 'flex'; return; }
-  empty.style.display = 'none';
-  grid.innerHTML = state.budgets.map(b => {
-    const spent = monthTxs.filter(t=>t.category===b.category).reduce((s,t)=>s+t.amount,0);
-    const pct = getPct(spent, b.limit);
-    const cls = pct >= 100 ? 'over' : pct >= 80 ? 'warn' : 'ok';
-    const remaining = b.limit - spent;
-    return `<div class="budget-card-item${pct>=100?' over-budget':''}">
-      <div class="budget-card-header">
-        <span class="budget-card-name">${b.category}</span>
-        <button class="budget-card-delete" onclick="deleteBudget('${b.id}')">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>
-        </button>
-      </div>
-      <div class="budget-card-amounts">
-        <span class="budget-spent ${cls}">${fmt(spent)}</span>
-        <span class="budget-limit-text">/ ${fmt(b.limit)}</span>
-      </div>
-      <div class="budget-card-progress">
-        <div class="progress-bar"><div class="progress-fill ${cls}" style="width:${Math.min(pct,100)}%"></div></div>
-      </div>
-      <div class="budget-card-footer">
-        <span class="budget-remaining">${remaining >= 0 ? 'Sisa: '+fmt(remaining) : 'Lebih: '+fmt(Math.abs(remaining))}</span>
-        <span class="budget-pct" style="color:${cls==='over'?'#DC2626':cls==='warn'?'#D97706':'#059669'}">${pct}%</span>
-      </div>
-    </div>`;
-  }).join('');
-}
-
-document.getElementById('btnAddBudget').addEventListener('click', () => document.getElementById('budgetForm').style.display = 'block');
-document.getElementById('cancelBudget').addEventListener('click', () => document.getElementById('budgetForm').style.display = 'none');
-document.getElementById('saveBudget').addEventListener('click', async () => {
-  const category = document.getElementById('budgetCategory').value;
-  const limit = +document.getElementById('budgetLimit').value;
-  if (!limit || limit <= 0) return showToast('Masukkan batas anggaran yang valid', 'error');
-  if (state.budgets.find(b=>b.category===category)) return showToast('Anggaran untuk kategori ini sudah ada', 'error');
-  try {
-    const budget = await API.post('/budgets', { category, limit });
-    state.budgets.push(budget);
-    document.getElementById('budgetForm').style.display = 'none';
-    document.getElementById('budgetLimit').value = '';
-    renderBudgets();
-    showToast('Anggaran berhasil ditambahkan');
-  } catch(e) { showToast('Gagal menyimpan: '+e.message, 'error'); }
-});
-
-window.deleteBudget = (id) => {
-  confirm('Hapus Anggaran', 'Apakah Anda yakin ingin menghapus anggaran ini?', async () => {
-    try {
-      await API.del('/budgets/' + id);
-      state.budgets = state.budgets.filter(b=>b.id!==id);
-      renderBudgets();
-      showToast('Anggaran berhasil dihapus');
-    } catch(e) { showToast('Gagal menghapus: '+e.message, 'error'); }
-  });
-};
 
 // ===== INIT =====
 initReportFilters();

@@ -15,12 +15,71 @@ import urllib.parse
 from datetime import datetime, date
 from pathlib import Path
 
+import re
 import websockets
+
+def clean_qwen_json(raw: str) -> str:
+    """Bersihkan output Qwen sebelum di-parse JSON."""
+    text = raw.strip()
+
+    # 1. Strip markdown fences ```json ... ```
+    if text.startswith("```"):
+        parts = text.split("```")
+        text = parts[1] if len(parts) > 1 else text
+        if text.startswith("json"):
+            text = text[4:]
+    text = text.strip()
+
+    # 2. Hapus citation markers: [[n]], [[n,m]], [n], 【n】
+    text = re.sub(r'\[\[[\d,\s]+\]\]', '', text)
+    text = re.sub(r'\[[\d]+\]', '', text)
+    text = re.sub(r'【[\d]+】', '', text)
+
+    # 3. Hapus markdown links [text](url) → ganti dengan text saja
+    #    Ini menangani kasus Qwen menempel [investor.id](http://...) di dalam nilai string
+    text = re.sub(r'\[([^\]]*)\]\(http[^\)]*\)', r'\1', text)
+
+    # 4. Hapus control characters tidak valid (kecuali \t \n \r — akan dihandle di langkah 5)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+
+    # 5. Fix newline/tab literal di dalam string JSON value
+    #    Strategi: parse karakter per karakter, di dalam string JSON
+    #    ganti \n \r \t literal → \\n \\r \\t
+    result = []
+    in_string = False
+    escape_next = False
+    for ch in text:
+        if escape_next:
+            result.append(ch)
+            escape_next = False
+            continue
+        if ch == '\\' and in_string:
+            result.append(ch)
+            escape_next = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            result.append(ch)
+            continue
+        if in_string:
+            if ch == '\n':
+                result.append('\\n')
+            elif ch == '\r':
+                result.append('\\r')
+            elif ch == '\t':
+                result.append('\\t')
+            else:
+                result.append(ch)
+        else:
+            result.append(ch)
+
+    return ''.join(result)
 
 # ===== KONFIGURASI =====
 VPS_HOST = "108.137.15.61"       # Ganti dengan IP/domain VPS
 VPS_PORT = 9560                  # Harus sama dengan WS_PORT di server Node.js
-RECONNECT_DELAY = 5              # Detik sebelum reconnect
+RECONNECT_DELAY     = 5          # Detik delay awal sebelum reconnect
+RECONNECT_MAX_DELAY = 60         # Batas maksimum delay reconnect (detik)
 DB_FILE = Path(__file__).parent / "fintrack_db.json"
 
 # Qwen AI Server
@@ -51,16 +110,16 @@ def load_db() -> dict:
                 data = json.load(f)
                 if "transactions" not in data:
                     data["transactions"] = []
-                if "budgets" not in data:
-                    data["budgets"] = []
                 if "investments" not in data:
                     data["investments"] = []
                 if "bills" not in data:
                     data["bills"] = []
+                if "report_ai" not in data:
+                    data["report_ai"] = {}
                 return data
         except (json.JSONDecodeError, IOError) as e:
             log.error(f"Gagal membaca database: {e}")
-    return {"transactions": [], "budgets": [], "investments": [], "bills": []}
+    return {"transactions": [], "investments": [], "bills": [], "report_ai": {}}
 
 
 def save_db(data: dict) -> bool:
@@ -111,44 +170,6 @@ def handle_delete_transaction(payload: dict, db: dict) -> dict:
     if not save_db(db):
         return {"ok": False, "error": "Gagal menyimpan ke database"}
     log.info(f"Transaksi dihapus: {tx_id}")
-    return {"ok": True}
-
-
-def handle_get_budgets(_payload: dict, db: dict) -> dict:
-    return {"ok": True, "data": db["budgets"]}
-
-
-def handle_add_budget(payload: dict, db: dict) -> dict:
-    budget = payload.get("data")
-    if not budget:
-        return {"ok": False, "error": "Data anggaran tidak ada"}
-    required = ["id", "category", "limit"]
-    for f in required:
-        if f not in budget:
-            return {"ok": False, "error": f"Field '{f}' tidak ada"}
-    # Cek duplikat kategori
-    existing = [b for b in db["budgets"] if b["category"] == budget["category"]]
-    if existing:
-        return {"ok": False, "error": f"Anggaran untuk '{budget['category']}' sudah ada"}
-    db["budgets"].append(budget)
-    if not save_db(db):
-        db["budgets"].pop()
-        return {"ok": False, "error": "Gagal menyimpan ke database"}
-    log.info(f"Anggaran ditambahkan: {budget['category']} - {budget['limit']}")
-    return {"ok": True}
-
-
-def handle_delete_budget(payload: dict, db: dict) -> dict:
-    budget_id = payload.get("id")
-    if not budget_id:
-        return {"ok": False, "error": "ID tidak ada"}
-    before = len(db["budgets"])
-    db["budgets"] = [b for b in db["budgets"] if b["id"] != budget_id]
-    if len(db["budgets"]) == before:
-        return {"ok": False, "error": "Anggaran tidak ditemukan"}
-    if not save_db(db):
-        return {"ok": False, "error": "Gagal menyimpan ke database"}
-    log.info(f"Anggaran dihapus: {budget_id}")
     return {"ok": True}
 
 
@@ -301,7 +322,8 @@ def handle_ai_dashboard(_payload: dict, db: dict) -> dict:
     """Ambil dashboard AI: IHSG, berita saham IDX, geopolitik. Cache 24 jam."""
     global _ai_cache
     now_ts = time.time()
-    if _ai_cache["dashboard"] and (now_ts - _ai_cache["dashboard_ts"]) < 86400:
+    force_refresh = _payload.get("force", False)
+    if not force_refresh and _ai_cache["dashboard"] and (now_ts - _ai_cache["dashboard_ts"]) < 86400:
         return {"ok": True, "data": _ai_cache["dashboard"], "cached": True}
 
     qwen_warmup()
@@ -320,24 +342,19 @@ Berikan data berikut dalam format JSON yang valid (tanpa markdown, hanya JSON mu
     {{"code": "KODE", "name": "Nama Perusahaan", "price": 0, "change_pct": 0.0, "direction": "up"|"down"}}
   ],
   "stock_news": [
-    {{"title": "Judul berita saham IDX", "summary": "Ringkasan singkat", "date": "tanggal", "sentiment": "positif"|"negatif"|"netral"}}
+    {{"title": "Judul berita saham IDX", "summary": "Ringkasan singkat", "date": "tanggal", "sentiment": "positif"|"negatif"|"netral", "url": "https://url-berita-asli.com/artikel", "source": "Nama Media"}}
   ],
   "geopolitik_news": [
-    {{"title": "Judul berita geopolitik", "summary": "Ringkasan dan dampak ke pasar IDX", "date": "tanggal", "impact": "positif"|"negatif"|"netral"}}
+    {{"title": "Judul berita geopolitik", "summary": "Ringkasan dan dampak ke pasar IDX", "date": "tanggal", "impact": "positif"|"negatif"|"netral", "url": "https://url-berita-asli.com/artikel", "source": "Nama Media"}}
   ],
   "market_summary": "Ringkasan kondisi pasar saham Indonesia hari ini dalam 2-3 kalimat."
 }}
-Isi dengan data aktual terbaru yang kamu ketahui. top_movers berisi 5 saham, stock_news berisi 4 berita, geopolitik_news berisi 3 berita."""
+Isi dengan data aktual terbaru yang kamu ketahui. top_movers berisi 5 saham, stock_news berisi 4 berita, geopolitik_news berisi 3 berita.
+Untuk setiap berita, sertakan url artikel asli dari media keuangan terpercaya seperti kontan.co.id, bisnis.com, cnbcindonesia.com, detik.com/finance, atau reuters.com. Jika tidak yakin URL persis, berikan URL halaman utama seksi keuangan media tersebut."""
 
     try:
         raw = qwen_call(prompt)
-        # Bersihkan jika ada markdown fence
-        cleaned = raw.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("```")[1]
-            if cleaned.startswith("json"):
-                cleaned = cleaned[4:]
-        parsed = json.loads(cleaned.strip())
+        parsed = json.loads(clean_qwen_json(raw))
         _ai_cache["dashboard"] = parsed
         _ai_cache["dashboard_ts"] = now_ts
         return {"ok": True, "data": parsed, "cached": False}
@@ -347,8 +364,9 @@ Isi dengan data aktual terbaru yang kamu ketahui. top_movers berisi 5 saham, sto
 
 
 def handle_ai_analyze(payload: dict, db: dict) -> dict:
-    """Analisa saham spesifik via Qwen."""
+    """Analisa saham spesifik via Qwen. Simpan hasil ke DB di field ai_analysis."""
     data = payload.get("data", {})
+    inv_id = data.get("id", "")
     code = data.get("code", "")
     name = data.get("name", "")
     shares = data.get("shares", 0)
@@ -373,23 +391,112 @@ Analisa saham berikut dan berikan respons dalam format JSON murni (tanpa markdow
   "catalysts": ["faktor positif 1", "faktor positif 2"],
   "risks": ["risiko 1", "risiko 2"],
   "news": [
-    {{"title": "Judul berita terkait {code}", "summary": "ringkasan", "sentiment": "positif"|"negatif"|"netral"}}
+    {{"title": "Judul berita terkait {code}", "summary": "ringkasan", "sentiment": "positif"|"negatif"|"netral", "url": "https://url-berita-asli.com/artikel", "source": "Nama Media"}}
   ],
   "updated": "{today_str}"
 }}
-Harga beli investor: Rp {buy_price}, jumlah saham: {shares} lembar."""
+Harga beli investor: Rp {buy_price}, jumlah saham: {shares} lembar.
+Untuk setiap berita terkait, sertakan url artikel asli dari media keuangan terpercaya (kontan.co.id, bisnis.com, cnbcindonesia.com, detik.com/finance, reuters.com). Jika tidak yakin URL persis, gunakan URL seksi keuangan media tersebut."""
 
     try:
         raw = qwen_call(prompt)
-        cleaned = raw.strip()
-        if cleaned.startswith("```"):
-            cleaned = cleaned.split("```")[1]
-            if cleaned.startswith("json"):
-                cleaned = cleaned[4:]
-        parsed = json.loads(cleaned.strip())
+        parsed = json.loads(clean_qwen_json(raw))
+
+        # Simpan hasil analisa ke record investasi di DB
+        if inv_id:
+            for i, inv in enumerate(db["investments"]):
+                if inv["id"] == inv_id:
+                    db["investments"][i]["ai_analysis"] = parsed
+                    db["investments"][i]["ai_analysis_at"] = datetime.now().isoformat()
+                    save_db(db)
+                    log.info(f"Analisa AI disimpan untuk {code} ({inv_id})")
+                    break
+
         return {"ok": True, "data": parsed}
     except Exception as e:
         log.error(f"AI analyze error: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def handle_ai_report(payload: dict, db: dict) -> dict:
+    """Analisa laporan keuangan bulanan via Qwen AI. Simpan hasil ke DB per bulan."""
+    data = payload.get("data", {})
+    month_label = data.get("month_label", "")
+    month_key   = data.get("month_key", "")      # format YYYY-MM
+    force       = data.get("force", False)
+    income = data.get("income", 0)
+    expense = data.get("expense", 0)
+    balance = data.get("balance", 0)
+    saving_rate = data.get("saving_rate", 0)
+    top_expense_cats = data.get("top_expense_cats", [])
+    top_income_cats = data.get("top_income_cats", [])
+    tx_count = data.get("tx_count", 0)
+
+    # Pastikan key report_ai ada di DB
+    if "report_ai" not in db:
+        db["report_ai"] = {}
+
+    # Return cached jika sudah ada dan tidak force
+    if not force and month_key and month_key in db["report_ai"]:
+        cached = db["report_ai"][month_key]
+        log.info(f"AI report cache hit: {month_key}")
+        return {"ok": True, "data": cached["result"], "cached": True, "analyzed_at": cached.get("analyzed_at")}
+
+    qwen_warmup()
+    today_str = date.today().strftime("%d %B %Y")
+
+    cats_str = ", ".join([f"{c['name']} (Rp{c['amount']:,})" for c in top_expense_cats]) or "Tidak ada"
+    income_str = ", ".join([f"{c['name']} (Rp{c['amount']:,})" for c in top_income_cats]) or "Tidak ada"
+
+    prompt = f"""Tanggal hari ini: {today_str}.
+Analisa laporan keuangan pribadi berikut untuk bulan {month_label} dan berikan respons dalam format JSON murni (tanpa markdown):
+{{
+  "health_score": <skor kesehatan keuangan 0-100>,
+  "health_label": "Sangat Baik" | "Baik" | "Cukup" | "Perlu Perhatian" | "Kritis",
+  "health_color": "green" | "cyan" | "yellow" | "orange" | "red",
+  "summary": "Ringkasan kondisi keuangan bulan ini dalam 2-3 kalimat.",
+  "highlights": [
+    {{"icon": "emoji", "label": "Judul insight", "value": "nilai atau info penting", "type": "positive"|"negative"|"neutral"}}
+  ],
+  "spending_analysis": "Analisa pola pengeluaran terbesar dan apakah wajar dalam 2-3 kalimat.",
+  "saving_analysis": "Analisa tingkat tabungan dan apakah sudah cukup dalam 1-2 kalimat.",
+  "recommendations": [
+    {{"title": "Judul rekomendasi", "detail": "Penjelasan singkat apa yang perlu dilakukan"}}
+  ],
+  "warnings": [
+    {{"title": "Judul peringatan", "detail": "Penjelasan risiko atau hal yang perlu diwaspadai"}}
+  ],
+  "next_month_tips": "Tips atau target keuangan untuk bulan depan dalam 1-2 kalimat."
+}}
+
+Data keuangan bulan {month_label}:
+- Total Pemasukan: Rp{income:,}
+- Total Pengeluaran: Rp{expense:,}
+- Saldo Bersih: Rp{balance:,}
+- Tingkat Tabungan: {saving_rate}%
+- Jumlah Transaksi: {tx_count}
+- Pengeluaran terbesar per kategori: {cats_str}
+- Sumber pemasukan: {income_str}
+
+Berikan highlights 4-5 poin penting, recommendations 2-3 poin, warnings 0-2 poin (hanya jika ada yang perlu diwaspadai)."""
+
+    try:
+        raw = qwen_call(prompt)
+        parsed = json.loads(clean_qwen_json(raw))
+        log.info(f"AI report selesai untuk {month_label}: score={parsed.get('health_score')}")
+
+        # Simpan ke DB
+        if month_key:
+            db["report_ai"][month_key] = {
+                "result": parsed,
+                "analyzed_at": datetime.now().isoformat()
+            }
+            save_db(db)
+            log.info(f"AI report disimpan: {month_key}")
+
+        return {"ok": True, "data": parsed, "cached": False, "analyzed_at": datetime.now().isoformat()}
+    except Exception as e:
+        log.error(f"AI report error: {e}")
         return {"ok": False, "error": str(e)}
 
 
@@ -398,9 +505,6 @@ HANDLERS = {
     "get_transactions": handle_get_transactions,
     "add_transaction": handle_add_transaction,
     "delete_transaction": handle_delete_transaction,
-    "get_budgets": handle_get_budgets,
-    "add_budget": handle_add_budget,
-    "delete_budget": handle_delete_budget,
     # Investments
     "get_investments": handle_get_investments,
     "add_investment": handle_add_investment,
@@ -414,6 +518,7 @@ HANDLERS = {
     # AI
     "ai_dashboard": handle_ai_dashboard,
     "ai_analyze": handle_ai_analyze,
+    "ai_report": handle_ai_report,
 }
 
 
@@ -446,7 +551,9 @@ def process_message(raw: str, db: dict) -> str:
 async def connect_and_serve():
     uri = f"ws://{VPS_HOST}:{VPS_PORT}"
     db = load_db()
-    log.info(f"Database dimuat: {len(db['transactions'])} transaksi, {len(db['budgets'])} anggaran")
+    log.info(f"Database dimuat: {len(db['transactions'])} transaksi, {len(db['investments'])} investasi")
+
+    delay = RECONNECT_DELAY  # delay saat ini (akan naik eksponensial jika gagal terus)
 
     while True:
         try:
@@ -456,28 +563,51 @@ async def connect_and_serve():
                 ping_interval=20,
                 ping_timeout=10,
                 open_timeout=10,
+                close_timeout=5,
             ) as ws:
                 log.info("Terhubung ke VPS!")
-                async for raw in ws:
-                    # Reload db setiap pesan untuk sinkronisasi (jika diubah manual)
-                    db = load_db()
-                    response = process_message(raw, db)
-                    await ws.send(response)
+                delay = RECONNECT_DELAY  # reset delay setelah berhasil konek
 
-        except websockets.exceptions.ConnectionRefusedError:
-            log.warning(f"Koneksi ditolak. VPS belum siap atau port salah. Mencoba lagi dalam {RECONNECT_DELAY}s...")
+                async for raw in ws:
+                    # Reload db setiap pesan agar sinkron jika file diubah manual
+                    db = load_db()
+                    try:
+                        response = process_message(raw, db)
+                        await ws.send(response)
+                    except Exception as e:
+                        log.error(f"Error memproses pesan: {e}")
+                        # Tetap lanjut, jangan putuskan koneksi hanya karena 1 pesan error
+
+        except asyncio.CancelledError:
+            log.info("Dihentikan oleh sistem.")
+            break
+
         except websockets.exceptions.InvalidURI:
             log.error(f"URI tidak valid: {uri}. Periksa VPS_HOST dan VPS_PORT.")
-            break
-        except (websockets.exceptions.WebSocketException, OSError) as e:
-            log.warning(f"Koneksi terputus: {e}. Mencoba lagi dalam {RECONNECT_DELAY}s...")
-        except asyncio.CancelledError:
-            log.info("Dihentikan.")
-            break
+            break  # URI salah → tidak ada gunanya retry
+
+        except websockets.exceptions.ConnectionClosedError as e:
+            # Koneksi putus tiba-tiba tanpa close frame (misal: VPS crash, network drop)
+            log.warning(f"Koneksi terputus tiba-tiba (no close frame): {e}")
+
+        except websockets.exceptions.ConnectionClosedOK:
+            # Koneksi ditutup dengan normal oleh VPS (misal: server restart)
+            log.info("Koneksi ditutup oleh VPS (normal close).")
+
+        except (ConnectionRefusedError, OSError) as e:
+            # Built-in Python error: VPS belum siap, port tertutup, atau network down
+            log.warning(f"Koneksi ditolak / network error: {type(e).__name__}: {e}")
+
+        except websockets.exceptions.WebSocketException as e:
+            log.warning(f"Koneksi WebSocket error: {type(e).__name__}: {e}")
+
         except Exception as e:
             log.exception(f"Error tidak terduga: {e}")
 
-        await asyncio.sleep(RECONNECT_DELAY)
+        # Exponential backoff: 5s → 10s → 20s → 40s → max 60s
+        log.info(f"Mencoba reconnect dalam {delay}s...")
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, RECONNECT_MAX_DELAY)
 
 
 # ===== ENTRY POINT =====
